@@ -899,12 +899,12 @@ def create_instrument_universe_table(factor_sensitivities_df, Sigma_Raw_df, misp
 
 # --- Streamlit Application Layout ---
 
-st.title("SOFR Futures PCA Analyzer")
+st.title("EURO Futures PCA Analyzer")
 
 # --- Sidebar Inputs ---
 st.sidebar.header("1. Data Uploads")
 price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'sofr rates.csv')", 
+    "Upload Historical Price Data (e.g., 'euro rates.csv')", 
     type=['csv'], 
     key='price_upload'
 )
