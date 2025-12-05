@@ -7,8 +7,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, date
 
+from io import BytesIO
+from matplotlib.backends.backend_pdf import PdfPages
+
+# --- PDF figure collections ---
+SECTION5_FIGURES = []
+SECTION9_FIGURES = []
+
+
 # --- Configuration ---
-st.set_page_config(layout="wide", page_title="EURO Futures PCA Analyzer")
+st.set_page_config(layout="wide", page_title="SOFR Futures PCA Analyzer")
 
 # --- Helper Functions for Data Processing ---
 
@@ -171,6 +179,76 @@ def calculate_k_step_double_butterflies(analysis_curve_df, k):
         )
 
     return pd.DataFrame(dbflies_data)
+
+
+def compute_all_derivatives_from_outrights_row(contract_labels, outrights_row):
+    """Given a single outright curve (Series indexed by contract labels),
+    compute all 3M/6M/12M spreads, flies, and double flies for that snapshot.
+
+    This is used in the PCA shock engine to rebuild **all** curve derivatives
+    from a shocked outright curve in a consistent way.
+    """
+    contracts = list(contract_labels)
+    n = len(contracts)
+
+    def _compute_for_k(k):
+        spreads = {}
+        flies = {}
+        dbflies = {}
+
+        # Spreads: C_i - C_{i+k}
+        for i in range(n - k):
+            c1 = contracts[i]
+            c2 = contracts[i + k]
+            spreads[f"{c1}-{c2}"] = outrights_row[c1] - outrights_row[c2]
+
+        # Flies: C_i - 2*C_{i+k} + C_{i+2k}
+        for i in range(n - 2 * k):
+            c1 = contracts[i]
+            c2 = contracts[i + k]
+            c3 = contracts[i + 2 * k]
+            flies[f"{c1}-2x{c2}+{c3}"] = (
+                outrights_row[c1]
+                - 2 * outrights_row[c2]
+                + outrights_row[c3]
+            )
+
+        # Double Flies: C_i - 3*C_{i+k} + 3*C_{i+2k} - C_{i+3k}
+        for i in range(n - 3 * k):
+            c1 = contracts[i]
+            c2 = contracts[i + k]
+            c3 = contracts[i + 2 * k]
+            c4 = contracts[i + 3 * k]
+            dbflies[f"{c1}-3x{c2}+3x{c3}-{c4}"] = (
+                outrights_row[c1]
+                - 3 * outrights_row[c2]
+                + 3 * outrights_row[c3]
+                - outrights_row[c4]
+            )
+
+        return (
+            pd.Series(spreads) if spreads else pd.Series(dtype=float),
+            pd.Series(flies) if flies else pd.Series(dtype=float),
+            pd.Series(dbflies) if dbflies else pd.Series(dtype=float),
+        )
+
+    # 3M (k=1), 6M (k=2), 12M (k=4)
+    spreads_3M, flies_3M, dbf_3M = _compute_for_k(1)
+    spreads_6M, flies_6M, dbf_6M = _compute_for_k(2)
+    spreads_12M, flies_12M, dbf_12M = _compute_for_k(4)
+
+    return {
+        "3M_spreads": spreads_3M,
+        "3M_flies": flies_3M,
+        "3M_dbf": dbf_3M,
+        "6M_spreads": spreads_6M,
+        "6M_flies": flies_6M,
+        "6M_dbf": dbf_6M,
+        "12M_spreads": spreads_12M,
+        "12M_flies": flies_12M,
+        "12M_dbf": dbf_12M,
+    }
+
 
 # --- END GENERALIZED DERIVATIVE CALCULATION FUNCTIONS ---
 
@@ -899,12 +977,12 @@ def create_instrument_universe_table(factor_sensitivities_df, Sigma_Raw_df, misp
 
 # --- Streamlit Application Layout ---
 
-st.title("EURO Futures PCA Analyzer")
+st.title("SOFR Futures PCA Analyzer")
 
 # --- Sidebar Inputs ---
 st.sidebar.header("1. Data Uploads")
 price_file = st.sidebar.file_uploader(
-    "Upload Historical Price Data (e.g., 'euro rates.csv')", 
+    "Upload Historical Price Data (e.g., 'sofr rates.csv')", 
     type=['csv'], 
     key='price_upload'
 )
@@ -1189,42 +1267,95 @@ if not price_df_filtered.empty:
         # --- Curve Snapshot (Section 5) ---
         st.header("5. Curve Snapshot (Original vs. PCA Fair Value)")
         
-        def plot_snapshot(historical_df, derivative_type, current_date, pc_count):
-            """Plots the market vs PCA fair value snapshot for a given derivative type."""
-            
+
+        def get_previous_date(df, current_date):
+            """Return the last available previous date in df before current_date."""
             try:
-                # 1. Get the snapshot for the selected date
+                prev_dates = df.index[df.index < current_date]
+                if len(prev_dates) == 0:
+                    return None
+                return prev_dates.max()
+            except Exception:
+                return None
+
+
+        def plot_snapshot(historical_df, derivative_type, current_date, pc_count):
+            """Plots the market vs PCA fair value snapshot (today vs previous day)."""
+
+            try:
+                # 1. Today's snapshot
                 market_values = historical_df.loc[current_date].filter(like='(Original)')
                 pca_fair_values = historical_df.loc[current_date].filter(like='(PCA)')
-                
-                # 2. Align and merge for plotting
+
+                # 2. Align and merge for plotting (today)
                 comparison = pd.DataFrame({
                     'Original': market_values.values,
                     'PCA Fair': pca_fair_values.values
                 }, index=[col.replace(f' (Original)', '').replace(f'{derivative_type}: ', '') for col in market_values.index])
-                
+
                 if comparison.empty:
                     st.info(f"No {derivative_type} data available for the selected analysis date {analysis_date.strftime('%Y-%m-%d')} after combining Original and PCA Fair values.")
                     return
-                
+
+                # 3. Previous-day snapshot
+                prev_date = get_previous_date(historical_df, current_date)
+                prev_series = None
+                if prev_date is not None:
+                    try:
+                        prev_market = historical_df.loc[prev_date].filter(like='(Original)')
+                        prev_series = pd.Series(
+                            prev_market.values,
+                            index=[col.replace(f' (Original)', '').replace(f'{derivative_type}: ', '') for col in prev_market.index],
+                            name='Prev Day'
+                        )
+                    except KeyError:
+                        prev_series = None
+
                 # --- Plot the Derivative ---
                 fig, ax = plt.subplots(figsize=(15, 7))
-                
-                ax.plot(comparison.index, comparison['Original'], label=f'Original Market {derivative_type}', marker='o', linestyle='-', linewidth=2.5, color='blue')
-                ax.plot(comparison.index, comparison['PCA Fair'], label=f'PCA Fair {derivative_type} ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
-                
+
+                ax.plot(
+                    comparison.index,
+                    comparison['Original'],
+                    label=f'Today Original {derivative_type} ({current_date.strftime("%Y-%m-%d")})',
+                    marker='o',
+                    linestyle='-',
+                    linewidth=2.5,
+                    color='blue'
+                )
+                ax.plot(
+                    comparison.index,
+                    comparison['PCA Fair'],
+                    label=f'Today PCA Fair {derivative_type} ({pc_count} PCs)',
+                    marker='x',
+                    linestyle='--',
+                    linewidth=2.5,
+                    color='red'
+                )
+
+                # Previous-day original curve, if available
+                if prev_series is not None:
+                    ax.plot(
+                        prev_series.index,
+                        prev_series.values,
+                        label=f'Prev Day Original {derivative_type} ({prev_date.strftime("%Y-%m-%d")})',
+                        marker='s',
+                        linestyle='-.',
+                        linewidth=2.0,
+                        color='green'
+                    )
+
                 mispricing = comparison['Original'] - comparison['PCA Fair']
                 ax.axhline(0, color='gray', linestyle='-', linewidth=0.5, alpha=0.7)
-                
-                # Annotate the derivative with the largest absolute mispricing
+
+                # Annotate the derivative with the largest absolute mispricing (today)
                 max_abs_mispricing = mispricing.abs().max()
                 if max_abs_mispricing > 0:
                     mispricing_contract = mispricing.abs().idxmax()
-                    # MODIFIED: * 10000 -> * 100
-                    mispricing_value = mispricing.loc[mispricing_contract] * 100 
-                    
+                    mispricing_value = mispricing.loc[mispricing_contract] * 100  # Rate %
+
                     ax.annotate(
-                        f"Mispricing: {mispricing_value:.4f} Rate %", # MODIFIED: Unit update
+                        f"Mispricing: {mispricing_value:.4f} Rate %",
                         (mispricing_contract, comparison.loc[mispricing_contract]['Original']), 
                         textcoords="offset points", 
                         xytext=(0, 10), 
@@ -1232,68 +1363,178 @@ if not price_df_filtered.empty:
                         fontsize=10, 
                         bbox=dict(boxstyle="round,pad=0.5", fc="yellow", alpha=0.5)
                     )
-                
-                ax.set_title(f'Market {derivative_type} vs. PCA Fair {derivative_type}', fontsize=16)
+
+                ax.set_title(f'Market {derivative_type} vs. PCA Fair {derivative_type} (Today vs Prev Day)', fontsize=16)
                 ax.set_xlabel(f'{derivative_type} Contract')
                 ax.set_ylabel(f'{derivative_type} Value (Price Difference)')
                 ax.legend(loc='upper right')
                 ax.grid(True, linestyle=':', alpha=0.6)
-                
+
                 plt.xticks(rotation=45, ha='right')
                 plt.tight_layout()
                 st.pyplot(fig)
-                
+
+                # Collect Section 5 figure for PDF download
+                SECTION5_FIGURES.append((fig, f"Section 5 – {derivative_type}"))
+
                 # --- Detailed Table ---
-                st.markdown(f"###### {derivative_type} Mispricing")
+                st.markdown(f"###### {derivative_type} Mispricing (Today vs PCA, with Prev Day if available)")
                 detailed_comparison = comparison.copy()
                 detailed_comparison.index.name = f'{derivative_type} Contract'
-                # MODIFIED: Column name and scaling updated
                 detailed_comparison['Mispricing (Rate %)'] = mispricing * 100 
                 detailed_comparison = detailed_comparison.rename(
                     columns={'Original': f'Original {derivative_type}', 'PCA Fair': f'PCA Fair {derivative_type}'}
                 )
-                
+
+                # Add previous-day original column if exists
+                if prev_series is not None:
+                    prev_align = prev_series.reindex(detailed_comparison.index)
+                    detailed_comparison[f'Prev Day Original {derivative_type} ({prev_date.strftime("%Y-%m-%d")})'] = prev_align.values
+
                 st.dataframe(
                     detailed_comparison.style.format({
                         f'Original {derivative_type}': "{:.4f}",
                         f'PCA Fair {derivative_type}': "{:.4f}",
-                        'Mispricing (Rate %)': "{:.4f}" # MODIFIED: Formatting to 4 decimals for clarity
+                        'Mispricing (Rate %)': "{:.4f}"
                     }), 
                     use_container_width=True
                 )
 
             except KeyError:
                  st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for {derivative_type}. Please choose a different date within the historical range.")
+        def plot_shock_derivative_snapshot(historical_df, derivative_type, shocked_series, current_date, pc_count, title_suffix=""):
+            """
+            Plots Original vs PCA Fair vs Shock Scenario for a given derivative family
+            on the selected analysis date, using the same x-axis ordering as Section 5.
+            """
+            try:
+                row = historical_df.loc[current_date]
+            except KeyError:
+                st.info(f"No {derivative_type} data available for the selected analysis date in shock snapshot.")
+                return
+
+            market_values = row.filter(like='(Original)')
+            pca_fair_values = row.filter(like='(PCA)')
+
+            if market_values.empty or pca_fair_values.empty:
+                st.info(f"{derivative_type}: Missing Original or PCA Fair values for shock snapshot.")
+                return
+
+            # Build a clean instrument index WITHOUT tenor prefixes (e.g. '3M Spread: ')
+            base_index = []
+            for col in market_values.index:
+                core = col.replace(' (Original)', '')
+                if ': ' in core:
+                    core = core.split(': ', 1)[1]
+                base_index.append(core)
+
+            comparison = pd.DataFrame(
+                {
+                    'Original': market_values.values,
+                    'PCA Fair': pca_fair_values.values,
+                },
+                index=base_index,
+            )
+
+            if shocked_series is None or len(shocked_series) == 0:
+                st.info(f"No shocked series supplied for {derivative_type} in shock snapshot.")
+                return
+
+            shocked_aligned = shocked_series.reindex(comparison.index)
+            if shocked_aligned.isna().all():
+                st.info(f"Shocked series for {derivative_type} could not be aligned to instruments.")
+                return
+
+            comparison['Shock Scenario'] = shocked_aligned.values
+
+            fig, ax = plt.subplots(figsize=(15, 7))
+            ax.plot(comparison.index, comparison['Original'], label=f'{derivative_type} Original', marker='o')
+            ax.plot(comparison.index, comparison['PCA Fair'], label=f'{derivative_type} PCA Fair ({pc_count} PCs)', marker='x', linestyle='--')
+            ax.plot(comparison.index, comparison['Shock Scenario'], label=f'{derivative_type} Shock {title_suffix}', marker='s', linestyle='-.')
+
+            ax.set_title(f'{derivative_type} Snapshot under Shock {title_suffix}')
+            ax.set_xlabel('Instrument')
+            ax.set_ylabel('Value (Price Points)')
+            ax.grid(True, linestyle=':', alpha=0.6)
+            ax.legend(loc='upper right')
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # Collect Section 9 shock figure for PDF download
+            SECTION9_FIGURES.append((fig, f"Section 9 – {derivative_type} {title_suffix}".strip()))
 
 
         # --- 5.1 Outright Price/Rate Curve Snapshot ---
+
         st.subheader("5.1 Outright Price/Rate Curve Snapshot")
         try:
             # 1. Get the snapshot for the selected date
             market_prices = historical_outrights_df.loc[analysis_dt].filter(like='(Original)')
             pca_fair_prices = historical_outrights_df.loc[analysis_dt].filter(like='(PCA)')
-            
+
             # 2. Align and merge for plotting
             curve_comparison = pd.DataFrame({
                 'Original': market_prices.values,
                 'PCA Fair': pca_fair_prices.values
             }, index=[col.replace(' (Original)', '') for col in market_prices.index])
 
-            # --- Plot the Curve ---
+            # --- Plot the Curve (Today vs Previous Day) ---
             fig_curve, ax_curve = plt.subplots(figsize=(15, 7))
-            
-            ax_curve.plot(curve_comparison.index, curve_comparison['Original'], label='Original Market Price', marker='o', linestyle='-', linewidth=2.5, color='blue')
-            ax_curve.plot(curve_comparison.index, curve_comparison['PCA Fair'], label=f'PCA Fair Price ({pc_count} PCs)', marker='x', linestyle='--', linewidth=2.5, color='red')
-            
-            ax_curve.set_title('Market Price Curve vs. PCA Fair Value Curve (Price = 100 - Rate)', fontsize=16)
+
+            # Today
+            ax_curve.plot(
+                curve_comparison.index,
+                curve_comparison['Original'],
+                label=f'Today Original Price ({analysis_dt.strftime("%Y-%m-%d")})',
+                marker='o',
+                linestyle='-',
+                linewidth=2.5,
+                color='blue'
+            )
+            ax_curve.plot(
+                curve_comparison.index,
+                curve_comparison['PCA Fair'],
+                label=f'Today PCA Fair Price ({pc_count} PCs)',
+                marker='x',
+                linestyle='--',
+                linewidth=2.5,
+                color='red'
+            )
+
+            # Previous day
+            prev_dt = get_previous_date(historical_outrights_df, analysis_dt)
+            if prev_dt is not None:
+                try:
+                    prev_prices = historical_outrights_df.loc[prev_dt].filter(like='(Original)')
+                    prev_cmp = pd.Series(
+                        prev_prices.values,
+                        index=[col.replace(' (Original)', '') for col in prev_prices.index]
+                    )
+                    ax_curve.plot(
+                        prev_cmp.index,
+                        prev_cmp.values,
+                        label=f'Prev Day Original Price ({prev_dt.strftime("%Y-%m-%d")})',
+                        marker='s',
+                        linestyle='-.',
+                        linewidth=2.0,
+                        color='green'
+                    )
+                except KeyError:
+                    pass
+
+            ax_curve.set_title('Market Price Curve vs. PCA Fair Value Curve (Price = 100 - Rate, Today vs Prev Day)', fontsize=16)
             ax_curve.set_xlabel('Contract Maturity')
             ax_curve.set_ylabel('Price (100 - Rate)')
             ax_curve.legend(loc='upper right')
             ax_curve.grid(True, linestyle=':', alpha=0.6)
-            
+
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
             st.pyplot(fig_curve)
+
+            # Collect Outright curve figure for Section 5 PDF
+            SECTION5_FIGURES.append((fig_curve, "Section 5 – Outright Curve"))
 
             # --- Detailed Contract Price/Rate Table (Outright) ---
             st.markdown("###### Outright Price and Rate Mispricing")
@@ -1301,30 +1542,27 @@ if not price_df_filtered.empty:
             detailed_comparison.index.name = 'Contract'
             detailed_comparison['Original Rate (%)'] = 100.0 - detailed_comparison['Original']
             detailed_comparison['PCA Fair Rate (%)'] = 100.0 - detailed_comparison['PCA Fair']
-            # MODIFIED: Column name and scaling updated
             detailed_comparison['Mispricing (Rate %)'] = (detailed_comparison['Original'] - detailed_comparison['PCA Fair']) * 100
-            
+
             detailed_comparison = detailed_comparison.rename(
                 columns={'Original': 'Original Price', 'PCA Fair': 'PCA Fair Price'}
             )
             detailed_comparison = detailed_comparison[[
-                'Original Price', 'Original Rate (%)', 'PCA Fair Price', 'PCA Fair Rate (%)', 'Mispricing (Rate %)' # MODIFIED: Column name update
+                'Original Price', 'Original Rate (%)', 'PCA Fair Price', 'PCA Fair Rate (%)', 'Mispricing (Rate %)'
             ]]
-            
+
             st.dataframe(
                 detailed_comparison.style.format({
                     'Original Price': "{:.4f}",
                     'PCA Fair Price': "{:.4f}",
                     'Original Rate (%)': "{:.4f}",
                     'PCA Fair Rate (%)': "{:.4f}",
-                    'Mispricing (Rate %)': "{:.4f}" # MODIFIED: Formatting to 4 decimals for clarity
+                    'Mispricing (Rate %)': "{:.4f}"
                 }), 
                 use_container_width=True
             )
         except KeyError:
             st.error(f"The selected analysis date **{analysis_date.strftime('%Y-%m-%d')}** is not present in the filtered price data for Outright Prices. Please choose a different date within the historical range.")
-
-
         # --------------------------- 3-Month (k=1) Derivatives ---------------------------
         # --- 5.2 Spread Snapshot (3M) ---
         st.subheader("5.2 3M Spread Snapshot (k=1, e.g., Z25-H26)")
@@ -1383,6 +1621,28 @@ if not price_df_filtered.empty:
             st.info("Not enough contracts (need 13 or more) to calculate and plot 12M double butterfly snapshot.")
             
             
+        # --------------------------- Download all Section 5 snapshots as PDF ---------------------------
+        st.subheader("Download All Section 5 Snapshots as PDF")
+
+        if not SECTION5_FIGURES:
+            st.info("Generate the Section 5 charts above to enable PDF download.")
+        else:
+            pdf_buffer_5 = BytesIO()
+            with PdfPages(pdf_buffer_5) as pdf:
+                for fig, title in SECTION5_FIGURES:
+                    if title:
+                        fig.suptitle(title)
+                    pdf.savefig(fig, bbox_inches="tight")
+
+            pdf_buffer_5.seek(0)
+
+            st.download_button(
+                label="📥 Download Section 5 Snapshots as PDF",
+                data=pdf_buffer_5,
+                file_name="Section5_Snapshots.pdf",
+                mime="application/pdf",
+            )
+
         # --------------------------- 6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section) ---------------------------
         st.header("6. PCA-Based Hedging Strategy (3M Spreads ONLY - Original Section)")
         # FIX: The following text must be wrapped in st.markdown() to prevent NameError
@@ -1795,6 +2055,748 @@ if not price_df_filtered.empty:
                 use_container_width=True
             )
 
+        
 
+# --------------------------- 8.4 Historical Backtest of Trade + Hedge Pair ---------------------------
+        st.markdown("---")
+        st.subheader("8.4 Historical Backtest: Trade + Hedge Portfolio")
+
+        st.markdown(r"""
+        This section lets you **simulate the historical behaviour** of a **Trade + Hedge** combination:
+
+        * You pick:
+          - A **trade instrument** and direction/size.
+          - A **hedge instrument** and hedge ratio $k$ (portfolio is $P = T - kH$).
+        * The tool then:
+          - Builds daily **P&L time series** for Trade, Hedge, and the combined portfolio.
+          - Computes **volatility before vs after hedging**.
+          - Shows the **cumulative P&L** evolution through time.
+
+        This is exactly how a bank desk sanity-checks hedges before putting risk on.
+        """)
+
+        # --- Helper: safely retrieve historical price series for a derivative label ---
+        def _get_price_series_for_label(derivative_label: str):
+            """
+            Safely retrieve the historical price series for a derivative label like:
+            "3M Spread: Z25-Z26", "6M Fly: Z25-Z27", etc.
+
+            This version:
+              ✔ uses the *_df naming convention consistently
+              ✔ checks globals() before accessing
+              ✔ gracefully returns None if data is missing
+            """
+            if ":" not in derivative_label:
+                return None
+
+            prefix, rest = derivative_label.split(": ", 1)
+            type_key = prefix.strip()
+
+            # Map instrument family to the standard *_df historical dataframes
+            hist_map_names = {
+                "3M Spread": "historical_spreads_3M_df",
+                "3M Fly": "historical_butterflies_3M_df",
+                "3M Double Fly": "historical_double_butterflies_3M_df",
+
+                "6M Spread": "historical_spreads_6M_df",
+                "6M Fly": "historical_butterflies_6M_df",
+                "6M Double Fly": "historical_double_butterflies_6M_df",
+
+                "12M Spread": "historical_spreads_12M_df",
+                "12M Fly": "historical_butterflies_12M_df",
+                "12M Double Fly": "historical_double_butterflies_12M_df",
+            }
+
+            if type_key not in hist_map_names:
+                return None
+
+            dataset_name = hist_map_names[type_key]
+
+            # Ensure the dataframe actually exists in the global namespace
+            if dataset_name not in globals():
+                return None
+
+            df = globals()[dataset_name]
+            if df is None or df.empty:
+                return None
+
+            col_name = f"{derivative_label} (Original)"
+            if col_name not in df.columns:
+                return None
+
+            return df[col_name].dropna()
+
+        def _compute_hedged_pnl_series(
+            trade_label: str,
+            hedge_label: str,
+            trade_direction: str,
+            trade_units: float,
+            hedge_ratio_k: float
+        ):
+            """
+            Build daily P&L for Trade, Hedge and Portfolio:
+                P_T = sign_T * N_T * ΔT
+                P_H = -k * N_T * ΔH
+            Portfolio PnL = P_T + P_H
+
+            This uses daily *differences* in the instrument prices (already spreads/flies).
+            """
+
+            trade_series = _get_price_series_for_label(trade_label)
+            hedge_series = _get_price_series_for_label(hedge_label)
+
+            if trade_series is None:
+                st.error(f"Historical data not found for trade instrument: {trade_label}")
+                return None
+            if hedge_series is None:
+                st.error(f"Historical data not found for hedge instrument: {hedge_label}")
+                return None
+
+            df_prices = pd.concat(
+                [trade_series.rename("Trade"), hedge_series.rename("Hedge")],
+                axis=1
+            ).dropna()
+
+            if df_prices.empty:
+                st.error("No overlapping history between trade and hedge instruments.")
+                return None
+
+            dTrade = df_prices["Trade"].diff().dropna()
+            dHedge = df_prices["Hedge"].diff().dropna()
+
+            pnl_df = pd.concat(
+                [dTrade.rename("dTrade"), dHedge.rename("dHedge")],
+                axis=1
+            ).dropna()
+
+            sign_T = 1 if trade_direction == "Long" else -1
+
+            pnl_df["Trade PnL"] = sign_T * trade_units * pnl_df["dTrade"]
+            pnl_df["Hedge PnL"] = -hedge_ratio_k * trade_units * pnl_df["dHedge"]
+            pnl_df["Portfolio PnL"] = pnl_df["Trade PnL"] + pnl_df["Hedge PnL"]
+
+            return pnl_df
+
+        # --- UI for backtest ---
+        if not Sigma_Raw_df.empty and Sigma_Raw_df.shape[1] > 1:
+
+            backtest_labels = Sigma_Raw_df.columns.tolist()
+
+            col_bt1, col_bt2 = st.columns(2)
+            with col_bt1:
+                backtest_trade = st.selectbox(
+                    "Backtest Trade Instrument",
+                    options=backtest_labels,
+                    key="backtest_trade"
+                )
+            with col_bt2:
+                backtest_hedge = st.selectbox(
+                    "Backtest Hedge Instrument",
+                    options=[x for x in backtest_labels if x != backtest_trade],
+                    key="backtest_hedge"
+                )
+
+            col_bt3, col_bt4, col_bt5 = st.columns(3)
+            with col_bt3:
+                backtest_trade_dir = st.selectbox(
+                    "Trade Direction (for backtest)",
+                    ["Long", "Short"],
+                    key="backtest_trade_dir"
+                )
+            with col_bt4:
+                backtest_trade_units = st.number_input(
+                    "Trade Size (units)",
+                    min_value=0.1,
+                    value=1.0,
+                    step=0.5,
+                    key="backtest_trade_units"
+                )
+            with col_bt5:
+                # Default k* from covariance for convenience
+                Var_H = Sigma_Raw_df.loc[backtest_hedge, backtest_hedge]
+                Cov_TH = Sigma_Raw_df.loc[backtest_trade, backtest_hedge]
+                default_k = float(Cov_TH / Var_H) if Var_H > 1e-9 else 0.0
+
+                backtest_k = st.number_input(
+                    "Hedge Ratio k (portfolio = T - kH)",
+                    value=default_k,
+                    step=0.1,
+                    format="%.4f",
+                    key="backtest_k"
+                )
+
+            if st.button("Run Historical Backtest", key="run_backtest"):
+                pnl_df = _compute_hedged_pnl_series(
+                    trade_label=backtest_trade,
+                    hedge_label=backtest_hedge,
+                    trade_direction=backtest_trade_dir,
+                    trade_units=backtest_trade_units,
+                    hedge_ratio_k=backtest_k
+                )
+
+                if pnl_df is not None and not pnl_df.empty:
+
+                    trade_vol = pnl_df["Trade PnL"].std() * 100
+                    port_vol = pnl_df["Portfolio PnL"].std() * 100
+                    vol_red_pct = (1 - port_vol / trade_vol) * 100 if trade_vol > 0 else float("nan")
+
+                    st.markdown("### Volatility Before vs After Hedging")
+                    st.markdown(f"""
+                    - **Trade-only Volatility:** `{trade_vol:.4f}` Rate %  
+                    - **Hedged Portfolio Vol:** `{port_vol:.4f}` Rate %  
+                    - **Volatility Reduction:** `{vol_red_pct:.2f}%`
+                    """)
+
+                    cumulative = pnl_df.cumsum()
+
+                    fig_bt, ax_bt = plt.subplots(figsize=(12, 5))
+                    ax_bt.plot(cumulative.index, cumulative["Trade PnL"], label="Trade P&L")
+                    ax_bt.plot(cumulative.index, cumulative["Hedge PnL"], label="Hedge P&L")
+                    ax_bt.plot(cumulative.index, cumulative["Portfolio PnL"], label="Portfolio P&L", linewidth=2)
+
+                    ax_bt.axhline(0, color="black", linewidth=0.8, linestyle="--")
+                    ax_bt.set_title(
+                        f"Cumulative P&L Backtest — {backtest_trade_dir} {backtest_trade_units} {backtest_trade} "
+                        f"vs Hedge (k={backtest_k:.4f} × {backtest_hedge})"
+                    )
+                    ax_bt.set_ylabel("Cumulative P&L")
+                    ax_bt.grid(True, linestyle=":", alpha=0.5)
+                    ax_bt.legend()
+
+                    st.pyplot(fig_bt)
+        else:
+            st.info("Backtest unavailable: covariance matrix for derivatives is empty.")
+
+# --------------------------- 9. PCA Shock Scenario Curve ---------------------------
+        st.header("9. PCA Shock Scenario Curve")
+
+        st.markdown(r"""
+This section performs a **PCA-based shock analysis** on the SOFR futures curve.
+
+**Idea:**  
+You can either:
+
+1. **Anchor a single derivative** (Spread / Fly / Double-Fly across 3M, 6M, 12M) and assume  
+   > "The market is *exactly correct* on this instrument on the analysis date."
+
+   The app then:
+   - Computes the PCA mispricing for that anchor
+   - Solves for a **factor shock** :math:`\Delta PC` such that  
+
+     \[
+     \text{Original} = \text{PCA Fair} + L \cdot \Delta PC \cdot \sigma
+     \]
+
+   - Applies this :math:`\Delta PC` to the entire PCA structure
+   - Rebuilds the **Outright curve** from shocked 3M spreads
+   - Recomputes **all** derivatives:
+     - 3M / 6M / 12M Spreads
+     - 3M / 6M / 12M Flies
+     - 3M / 6M / 12M Double Flies  
+   - Shows:
+     - Original vs PCA vs Shocked curve
+     - A full **shock difference table** for all instruments.
+
+2. Or apply a **Factor Preset Scenario** (Level / Slope / Curvature):
+   - Directly shock PC1 / PC2 / PC3 by +1 standard deviation.
+   - See how the full curve and all derivatives move under a pure factor shock.
+
+This gives a **curve-consistent, PCA-based view** of how the SOFR strip must move  
+if a particular part of the curve is assumed to be "right" or if a pure factor view is imposed.
+        """)
+
+        # ----------------------- 9.1 Factor Preset Scenarios -----------------------
+        st.subheader("9.1 PCA Factor Preset Scenarios (PC1 / PC2 / PC3)")
+
+        preset = st.selectbox(
+            "Select a PCA factor scenario (applies directly to PCs):",
+            ["None", "Level (+1σ PC1)", "Slope (+1σ PC2)", "Curvature (+1σ PC3)"],
+            key="pca_preset_scenario"
+        )
+
+        if preset != "None" and st.button("Apply PCA Factor Preset", key="btn_preset_scenario"):
+            try:
+                delta_PC = np.zeros(pc_count)
+
+                if "Level" in preset and pc_count >= 1:
+                    delta_PC[0] = 1.0
+                if "Slope" in preset and pc_count >= 2:
+                    delta_PC[1] = 1.0
+                if "Curvature" in preset and pc_count >= 3:
+                    delta_PC[2] = 1.0
+
+                st.markdown("**Factor shock vector ΔPC used for this preset:**")
+                st.dataframe(
+                    pd.DataFrame(
+                        {"ΔPC": delta_PC[:pc_count]},
+                        index=[f"PC{i+1}" for i in range(pc_count)]
+                    ).style.format("{:.4f}"),
+                    use_container_width=True
+                )
+
+                # 1) Apply ΔPC to all 3M spreads
+                data_mean = spreads_3M_df_clean.mean()
+                data_std = spreads_3M_df_clean.std()
+                L_spread = loadings_spread.values[:, :pc_count]
+                delta_Z = L_spread @ delta_PC
+                delta_Y = delta_Z * data_std.values
+
+                reconstructed_scaled = scores.values[:, :pc_count] @ L_spread.T
+                reconstructed_spreads_3M_base = pd.DataFrame(
+                    reconstructed_scaled * data_std.values + data_mean.values,
+                    index=spreads_3M_df_clean.index,
+                    columns=spreads_3M_df_clean.columns
+                )
+
+                # Shocked 3M spreads = base PCA fair + delta_Y
+                shocked_spreads_3M = reconstructed_spreads_3M_base.copy()
+                shocked_spreads_3M.loc[:, :] = (
+                    shocked_spreads_3M.values + delta_Y.reshape(1, -1)
+                )
+
+                # 2) Rebuild outrights on the analysis date from shocked 3M spreads
+                if analysis_dt not in shocked_spreads_3M.index:
+                    st.warning("Analysis date not present in reconstructed 3M spreads for preset scenario.")
+                else:
+                    # Rebuild shocked outrights using the same nearest-contract anchor logic
+                    outrights_row = analysis_curve_df.loc[analysis_dt]
+                    shocked_outrights = pd.Series(index=contract_labels, dtype=float)
+                    shocked_outrights.iloc[0] = outrights_row.iloc[0]
+
+                    row_spreads = shocked_spreads_3M.loc[analysis_dt]
+
+                    for i in range(1, len(contract_labels)):
+                        prev_c = contract_labels[i - 1]
+                        curr_c = contract_labels[i]
+                        spread_label = f"{prev_c}-{curr_c}"
+                        if spread_label in row_spreads.index:
+                            shocked_outrights[curr_c] = shocked_outrights[prev_c] - row_spreads[spread_label]
+                        else:
+                            shocked_outrights[curr_c] = shocked_outrights[prev_c]
+
+                    # 3) Recompute all derivatives from shocked outrights
+                    shocked_derivs_preset = compute_all_derivatives_from_outrights_row(contract_labels, shocked_outrights)
+
+                    # 4) Plot curve comparison
+                    try:
+                        curve_row = historical_outrights_df.loc[analysis_dt]
+                        market_prices = curve_row.filter(like="(Original)")
+                        pca_fair_prices = curve_row.filter(like="(PCA)")
+                        contracts_idx = [c.replace(" (Original)", "") for c in market_prices.index]
+
+                        df_curve = pd.DataFrame(
+                            {
+                                "Original": market_prices.values,
+                                "PCA Fair": pca_fair_prices.values,
+                                "Preset Shock": shocked_outrights.reindex(contracts_idx).values,
+                            },
+                            index=contracts_idx
+                        )
+
+                        fig_preset, ax_preset = plt.subplots(figsize=(15, 7))
+                        ax_preset.plot(df_curve.index, df_curve["Original"], label="Original", marker="o")
+                        ax_preset.plot(df_curve.index, df_curve["PCA Fair"], label=f"PCA Fair ({pc_count} PCs)", marker="x", linestyle="--")
+                        ax_preset.plot(df_curve.index, df_curve["Preset Shock"], label=preset, marker="s", linestyle="-.")
+                        ax_preset.set_title(f"Outright Curve under PCA Factor Preset: {preset}")
+                        ax_preset.set_xlabel("Contract Maturity")
+                        ax_preset.set_ylabel("Price (100 - Rate)")
+                        ax_preset.grid(True, linestyle=":", alpha=0.6)
+                        ax_preset.legend(loc="upper right")
+                        plt.xticks(rotation=45, ha="right")
+                        plt.tight_layout()
+                        st.pyplot(fig_preset)
+                        # Shocked Derivative Snapshots under Preset Scenario
+                        st.markdown("#### Shocked Derivative Snapshots under Preset Scenario")
+                        # 3M family
+                        if not historical_spreads_3M_df.empty and shocked_derivs_preset.get('3M_spreads') is not None:
+                            st.subheader("Preset Shock - 3M Spreads")
+                            plot_shock_derivative_snapshot(
+                                historical_spreads_3M_df,
+                                "3M Spread",
+                                shocked_derivs_preset.get('3M_spreads'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        if not historical_butterflies_3M_df.empty and shocked_derivs_preset.get('3M_flies') is not None:
+                            st.subheader("Preset Shock - 3M Flies")
+                            plot_shock_derivative_snapshot(
+                                historical_butterflies_3M_df,
+                                "3M Butterfly",
+                                shocked_derivs_preset.get('3M_flies'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        if not historical_double_butterflies_3M_df.empty and shocked_derivs_preset.get('3M_dbf') is not None:
+                            st.subheader("Preset Shock - 3M Double Flies")
+                            plot_shock_derivative_snapshot(
+                                historical_double_butterflies_3M_df,
+                                "3M Double Butterfly",
+                                shocked_derivs_preset.get('3M_dbf'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        # 6M family
+                        if not historical_spreads_6M_df.empty and shocked_derivs_preset.get('6M_spreads') is not None:
+                            st.subheader("Preset Shock - 6M Spreads")
+                            plot_shock_derivative_snapshot(
+                                historical_spreads_6M_df,
+                                "6M Spread",
+                                shocked_derivs_preset.get('6M_spreads'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        if not historical_butterflies_6M_df.empty and shocked_derivs_preset.get('6M_flies') is not None:
+                            st.subheader("Preset Shock - 6M Flies")
+                            plot_shock_derivative_snapshot(
+                                historical_butterflies_6M_df,
+                                "6M Butterfly",
+                                shocked_derivs_preset.get('6M_flies'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        if not historical_double_butterflies_6M_df.empty and shocked_derivs_preset.get('6M_dbf') is not None:
+                            st.subheader("Preset Shock - 6M Double Flies")
+                            plot_shock_derivative_snapshot(
+                                historical_double_butterflies_6M_df,
+                                "6M Double Butterfly",
+                                shocked_derivs_preset.get('6M_dbf'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        # 12M family
+                        if not historical_spreads_12M_df.empty and shocked_derivs_preset.get('12M_spreads') is not None:
+                            st.subheader("Preset Shock - 12M Spreads")
+                            plot_shock_derivative_snapshot(
+                                historical_spreads_12M_df,
+                                "12M Spread",
+                                shocked_derivs_preset.get('12M_spreads'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        if not historical_butterflies_12M_df.empty and shocked_derivs_preset.get('12M_flies') is not None:
+                            st.subheader("Preset Shock - 12M Flies")
+                            plot_shock_derivative_snapshot(
+                                historical_butterflies_12M_df,
+                                "12M Butterfly",
+                                shocked_derivs_preset.get('12M_flies'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+                        if not historical_double_butterflies_12M_df.empty and shocked_derivs_preset.get('12M_dbf') is not None:
+                            st.subheader("Preset Shock - 12M Double Flies")
+                            plot_shock_derivative_snapshot(
+                                historical_double_butterflies_12M_df,
+                                "12M Double Butterfly",
+                                shocked_derivs_preset.get('12M_dbf'),
+                                analysis_dt,
+                                pc_count,
+                                title_suffix=f"(Preset: {preset})",
+                            )
+
+                    except KeyError:
+                        st.warning("Cannot show outright preset curve snapshot (analysis date missing in historical outrights).")
+
+            except Exception as e:
+                st.error(f"PCA factor preset scenario failed: {e}")
+
+                                    # ------------------- 9.2 Anchor-Based PCA Shock (Weighted Solver) -------------------
+st.subheader("9.2 Anchor-Based Shock: Assume 1–2 Instruments Are Correct")
+
+# 1) Build generalized derivatives universe
+all_deriv_list = [
+    spreads_3M_df_raw.rename(columns=lambda x: f"3M Spread: {x}"),
+    butterflies_3M_df.rename(columns=lambda x: f"3M Fly: {x}"),
+    double_butterflies_3M_df.rename(columns=lambda x: f"3M Double Fly: {x}"),
+    spreads_6M_df.rename(columns=lambda x: f"6M Spread: {x}"),
+    butterflies_6M_df.rename(columns=lambda x: f"6M Fly: {x}"),
+    double_butterflies_6M_df.rename(columns=lambda x: f"6M Double Fly: {x}"),
+    spreads_12M_df.rename(columns=lambda x: f"12M Spread: {x}"),
+    butterflies_12M_df.rename(columns=lambda x: f"12M Fly: {x}"),
+    double_butterflies_12M_df.rename(columns=lambda x: f"12M Double Fly: {x}"),
+]
+all_deriv_list = [df for df in all_deriv_list if df is not None and not df.empty]
+
+if len(all_deriv_list) == 0:
+    st.warning("No derivatives available for anchor shock.")
+else:
+    all_deriv_df = pd.concat(all_deriv_list, axis=1)
+
+    Sigma_raw, deriv_aligned, loadings_gen = calculate_derivatives_covariance_generalized(
+        all_deriv_df, scores, eigenvalues, pc_count
+    )
+
+    if loadings_gen.empty:
+        st.warning("General PCA loadings could not be computed.")
     else:
-        st.error("PCA failed. Please check your data quantity and quality.")
+
+        # ---------------- Instrument type mappings ----------------
+        hist_map = {
+            "3M Spread": historical_spreads_3M_df,
+            "3M Fly": historical_butterflies_3M_df,
+            "3M Double Fly": historical_double_butterflies_3M_df,
+            "6M Spread": historical_spreads_6M_df,
+            "6M Fly": historical_butterflies_6M_df,
+            "6M Double Fly": historical_double_butterflies_6M_df,
+            "12M Spread": historical_spreads_12M_df,
+            "12M Fly": historical_butterflies_12M_df,
+            "12M Double Fly": historical_double_butterflies_12M_df,
+        }
+
+        prefix_map = {
+            "3M Spread": "3M Spread: ",
+            "3M Fly": "3M Fly: ",
+            "3M Double Fly": "3M Double Fly: ",
+            "6M Spread": "6M Spread: ",
+            "6M Fly": "6M Fly: ",
+            "6M Double Fly": "6M Double Fly: ",
+            "12M Spread": "12M Spread: ",
+            "12M Fly": "12M Fly: ",
+            "12M Double Fly": "12M Double Fly: ",
+        }
+
+        # ---------------- PRIMARY ANCHOR ----------------
+        anchor_type1 = st.selectbox("Primary anchor instrument type:",
+                                    list(hist_map.keys()), key="anc_t1")
+        hist1 = hist_map[anchor_type1]
+
+        if hist1 is not None and not hist1.empty:
+            prefix1 = prefix_map[anchor_type1]
+            instr_list1 = [c for c in all_deriv_df.columns if c.startswith(prefix1)]
+
+            if len(instr_list1) == 0:
+                st.warning("No matching instruments found for primary anchor.")
+            else:
+                anchor_label1 = st.selectbox("Select primary anchor instrument:",
+                                             sorted(instr_list1), key="anc_l1")
+
+                # ---------------- OPTIONAL SECOND ANCHOR ----------------
+                anchor_type2 = st.selectbox("Optional second anchor (any type):",
+                                            ["<None>"] + list(hist_map.keys()), key="anc_t2")
+
+                anchor_label2 = None
+                hist2 = None
+                prefix2 = None
+
+                if anchor_type2 != "<None>":
+                    hist2 = hist_map[anchor_type2]
+                    if hist2 is not None and not hist2.empty:
+                        prefix2 = prefix_map[anchor_type2]
+                        instr_list2 = [c for c in all_deriv_df.columns if c.startswith(prefix2)]
+                        if len(instr_list2) > 0:
+                            anchor_label2 = st.selectbox("Select second anchor:",
+                                                         sorted(instr_list2), key="anc_l2")
+
+                # ===================== RUN SHOCK BUTTON =====================
+                if st.button("Run Anchor Shock"):
+
+                    L_rows = []
+                    Z_vals = []
+                    anchor_names = []
+
+                    # --------------------------------------------------------------------
+                    # Helper for reading/processing SINGLE anchor
+                    # --------------------------------------------------------------------
+                    def process_anchor(anchor_label, anchor_type, hist_df):
+                        """
+                        Returns: (L_row, Z_value, anchor_label) or None on failure
+                        """
+                        orig_c = anchor_label + " (Original)"
+                        pca_c = anchor_label + " (PCA)"
+
+                        if analysis_dt not in hist_df.index:
+                            return None
+                        if orig_c not in hist_df.columns or pca_c not in hist_df.columns:
+                            return None
+
+                        row = hist_df.loc[analysis_dt]
+                        shock_val = row[orig_c] - row[pca_c]
+
+                        # Select correct sigma and loadings
+                        if anchor_type == "3M Spread":   # use exact 3M PCA loadings
+                            core = anchor_label.replace("3M Spread: ", "")
+                            if core in spreads_3M_df_clean.columns:
+                                sigma = spreads_3M_df_clean.std()[core]
+                                idx = list(spreads_3M_df_clean.columns).index(core)
+                                L = loadings_spread.values[idx, :pc_count]
+                            else:
+                                sigma = all_deriv_df[anchor_label].std()
+                                L = loadings_gen.loc[anchor_label].iloc[:pc_count].values
+                        else:
+                            sigma = all_deriv_df[anchor_label].std()
+                            L = loadings_gen.loc[anchor_label].iloc[:pc_count].values
+
+                        if sigma <= 0:
+                            return None
+
+                        Z = shock_val / sigma
+                        return (L, Z, anchor_label)
+
+                    # ---------------- Add Anchor 1 ----------------
+                    out1 = process_anchor(anchor_label1, anchor_type1, hist1)
+                    if out1 is not None:
+                        L_rows.append(out1[0])
+                        Z_vals.append(out1[1])
+                        anchor_names.append(out1[2])
+
+                    # ---------------- Add Anchor 2 ----------------
+                    if anchor_label2 is not None and hist2 is not None:
+                        out2 = process_anchor(anchor_label2, anchor_type2, hist2)
+                        if out2 is not None:
+                            L_rows.append(out2[0])
+                            Z_vals.append(out2[1])
+                            anchor_names.append(out2[2])
+
+                    if len(Z_vals) == 0:
+                        st.error("No valid anchors to compute shock.")
+                    else:
+                        # --------------------------------------------------------------------
+                        # Weighted PCA optimization:
+                        #
+                        # minimize    ΔPCᵀ W ΔPC
+                        # subject to  L ΔPC = Z
+                        #
+                        # solution:
+                        # ΔPC = W⁻¹ Lᵀ (L W⁻¹ Lᵀ)⁻¹ Z
+                        # --------------------------------------------------------------------
+                        pc_std = scores.iloc[:, :pc_count].std().values
+                        W_inv = np.diag(pc_std ** 2)
+                        W = np.diag(1.0 / (pc_std ** 2))
+
+                        L = np.vstack(L_rows)
+                        Z = np.array(Z_vals)
+
+                        M = L @ W_inv @ L.T
+                        try:
+                            M_inv = np.linalg.inv(M)
+                        except np.linalg.LinAlgError:
+                            M_inv = np.linalg.pinv(M)
+
+                        delta_PC = W_inv @ L.T @ (M_inv @ Z)
+
+                        # ---------------- Display ΔPC ----------------
+                        st.markdown("### ΔPC (Weighted Minimum-Variance Solution)")
+                        st.dataframe(
+                            pd.DataFrame(
+                                {"ΔPC": delta_PC},
+                                index=[f"PC{i+1}" for i in range(pc_count)]
+                            ).style.format("{:.6f}")
+                        )
+                        st.write("Anchors used:", ", ".join(anchor_names))
+
+                        # -------------------------------------------------------
+                        # Apply ΔPC to reconstruct 3M spreads
+                        # -------------------------------------------------------
+                        mean3 = spreads_3M_df_clean.mean()
+                        std3 = spreads_3M_df_clean.std()
+                        L_sp = loadings_spread.values[:, :pc_count]
+
+                        deltaZ3 = L_sp @ delta_PC
+                        deltaY3 = deltaZ3 * std3.values
+
+                        base_scaled = scores.iloc[:, :pc_count].values @ L_sp.T
+                        base_3m = pd.DataFrame(
+                            base_scaled * std3.values + mean3.values,
+                            index=spreads_3M_df_clean.index,
+                            columns=spreads_3M_df_clean.columns
+                        )
+
+                        shocked_3m = base_3m.copy()
+                        shocked_3m.loc[:, :] = shocked_3m.values + deltaY3.reshape(1, -1)
+
+                        # -------------------------------------------------------
+                        # Build shocked outrights
+                        # -------------------------------------------------------
+                        if analysis_dt not in shocked_3m.index:
+                            st.error("Analysis date missing in shocked spreads.")
+                        else:
+                            outr_row = analysis_curve_df.loc[analysis_dt]
+                            shocked_out = pd.Series(index=contract_labels, dtype=float)
+                            shocked_out.iloc[0] = outr_row.iloc[0]
+
+                            row_sp = shocked_3m.loc[analysis_dt]
+
+                            for i in range(1, len(contract_labels)):
+                                prev, curr = contract_labels[i - 1], contract_labels[i]
+                                sp_lbl = f"{prev}-{curr}"
+                                if sp_lbl in row_sp.index:
+                                    shocked_out[curr] = shocked_out[prev] - row_sp[sp_lbl]
+                                else:
+                                    shocked_out[curr] = shocked_out[prev]
+
+                            # -------------------------------------------------------
+                            # Compute all shocked derivatives
+                            # -------------------------------------------------------
+                            shocked_derivs = compute_all_derivatives_from_outrights_row(
+                                contract_labels, shocked_out
+                            )
+
+                            # -------------------------------------------------------
+                            # Plot curves
+                            # -------------------------------------------------------
+                            try:
+                                curve_row = historical_outrights_df.loc[analysis_dt]
+                                mkt = curve_row.filter(like="(Original)")
+                                pca_v = curve_row.filter(like="(PCA)")
+                                idx = [c.replace(" (Original)", "") for c in mkt.index]
+
+                                dfc = pd.DataFrame(
+                                    {
+                                        "Original": mkt.values,
+                                        "PCA Fair": pca_v.values,
+                                        "Anchor Shock": shocked_out.reindex(idx).values,
+                                    },
+                                    index=idx,
+                                )
+
+                                fig, ax = plt.subplots(figsize=(15, 7))
+                                ax.plot(dfc.index, dfc["Original"], label="Original", marker="o")
+                                ax.plot(dfc.index, dfc["PCA Fair"], label="PCA Fair", linestyle="--")
+                                ax.plot(dfc.index, dfc["Anchor Shock"], label="Anchor Shock", linestyle="-.")
+
+                                ax.set_title("Outright Curve Under Anchor-Based Shock")
+                                ax.set_xlabel("Contract")
+                                ax.set_ylabel("Price (100 - Rate)")
+                                ax.grid(True, linestyle=":")
+                                ax.legend()
+                                plt.xticks(rotation=45)
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                            except:
+                                st.error("Could not plot anchor-shocked curve.")
+
+                            # -------------------------------------------------------
+                            # Shocked derivative snapshots
+                            # -------------------------------------------------------
+                            st.markdown("### Shocked Derivative Snapshots")
+
+                            fams = [
+                                ("3M Spread", historical_spreads_3M_df, "3M_spreads"),
+                                ("3M Fly", historical_butterflies_3M_df, "3M_flies"),
+                                ("3M Double Fly", historical_double_butterflies_3M_df, "3M_dbf"),
+                                ("6M Spread", historical_spreads_6M_df, "6M_spreads"),
+                                ("6M Fly", historical_butterflies_6M_df, "6M_flies"),
+                                ("6M Double Fly", historical_double_butterflies_6M_df, "6M_dbf"),
+                                ("12M Spread", historical_spreads_12M_df, "12M_spreads"),
+                                ("12M Fly", historical_butterflies_12M_df, "12M_flies"),
+                                ("12M Double Fly", historical_double_butterflies_12M_df, "12M_dbf"),
+                            ]
+
+                            for fam_name, fam_hist, key in fams:
+                                if fam_hist is not None and key in shocked_derivs and shocked_derivs[key] is not None:
+                                    st.subheader(fam_name)
+                                    plot_shock_derivative_snapshot(
+                                        fam_hist,
+                                        fam_name,
+                                        shocked_derivs[key],
+                                        analysis_dt,
+                                        pc_count,
+                                        title_suffix="(Anchor Shock)",
+                                    )
